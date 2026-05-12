@@ -1,0 +1,351 @@
+name: Download Main Video from Webpage
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the page containing the video'
+        required: true
+        type: string
+
+jobs:
+  download-video:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm install puppeteer
+          npx puppeteer browsers install chrome
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
+          chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Extract and download main video
+        run: |
+          node << 'EOF'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+
+          (async () => {
+            const url = '${{ github.event.inputs.url }}';
+            
+            console.log(`🔍 Analyzing page: ${url}`);
+
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+
+            const page = await browser.newPage();
+            
+            // Store video candidates with metadata
+            let videoCandidates = [];
+            
+            page.on('response', response => {
+              const responseUrl = response.url();
+              const contentType = response.headers()['content-type'] || '';
+              
+              // Detect video files
+              if (responseUrl.match(/\.(mp4|m3u8|webm|mkv|ts|flv)(\?|$)/i) ||
+                  contentType.includes('video/')) {
+                
+                // Get size if possible (to identify main video)
+                const contentLength = response.headers()['content-length'];
+                const size = contentLength ? parseInt(contentLength) : 0;
+                
+                videoCandidates.push({
+                  url: responseUrl,
+                  size: size,
+                  isM3u8: responseUrl.includes('.m3u8'),
+                  isAd: responseUrl.includes('ad') || 
+                         responseUrl.includes('advert') || 
+                         responseUrl.includes('preroll') ||
+                         responseUrl.includes('google') ||
+                         responseUrl.includes('doubleclick')
+                });
+                
+                console.log(`🎥 Candidate: ${responseUrl.substring(0, 80)}... (${size ? (size/1024/1024).toFixed(1)+'MB' : 'size unknown'})`);
+              }
+            });
+
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+            
+            // Wait for video player to fully load
+            await new Promise(r => setTimeout(r, 5000));
+            
+            // Scroll to trigger lazy loading
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await new Promise(r => setTimeout(r, 3000));
+            
+            // Try to find the main video element and get its source
+            const mainVideoInfo = await page.evaluate(() => {
+              // Find the largest video element on page
+              const videos = Array.from(document.querySelectorAll('video'));
+              let bestVideo = null;
+              let maxArea = 0;
+              
+              for (const video of videos) {
+                const rect = video.getBoundingClientRect();
+                const area = rect.width * rect.height;
+                if (area > maxArea && area > 10000) { // at least 100x100 pixels
+                  maxArea = area;
+                  bestVideo = video;
+                }
+              }
+              
+              if (bestVideo) {
+                const src = bestVideo.src || bestVideo.currentSrc;
+                const poster = bestVideo.poster;
+                return {
+                  videoElementSrc: src,
+                  poster: poster,
+                  area: maxArea,
+                  hasVideo: true
+                };
+              }
+              
+              // Also check for iframe players (YouTube, Vimeo, etc.)
+              const iframes = Array.from(document.querySelectorAll('iframe[src*="youtube"], iframe[src*="vimeo"], iframe[src*="player"]'));
+              if (iframes.length > 0) {
+                return {
+                  iframeSrc: iframes[0].src,
+                  hasIframe: true
+                };
+              }
+              
+              return { hasVideo: false };
+            });
+            
+            console.log('\n📊 Main video analysis:');
+            console.log(JSON.stringify(mainVideoInfo, null, 2));
+            
+            // Filter out ad videos and find the largest video
+            let realVideos = videoCandidates.filter(v => 
+              !v.isAd && 
+              v.size > 1024 && // larger than 1KB
+              (v.url.includes('/video/') || 
+               v.url.includes('/media/') || 
+               v.url.includes('/content/') ||
+               v.url.includes('/storage/') ||
+               !v.url.includes('/ads/'))
+            );
+            
+            // If no real videos found, take all non-ad videos
+            if (realVideos.length === 0) {
+              realVideos = videoCandidates.filter(v => !v.isAd);
+            }
+            
+            // Sort by size (largest first)
+            realVideos.sort((a, b) => b.size - a.size);
+            
+            console.log(`\n📹 Filtered videos (non-ad): ${realVideos.length}`);
+            
+            let finalVideoUrl = null;
+            
+            // Try to get from video element first
+            if (mainVideoInfo.videoElementSrc && mainVideoInfo.videoElementSrc.startsWith('http')) {
+              finalVideoUrl = mainVideoInfo.videoElementSrc;
+              console.log(`✅ Found main video from <video> tag: ${finalVideoUrl.substring(0, 80)}`);
+            }
+            // Then try the largest captured video
+            else if (realVideos.length > 0) {
+              finalVideoUrl = realVideos[0].url;
+              console.log(`✅ Found main video from network (size: ${(realVideos[0].size/1024/1024).toFixed(1)}MB)`);
+            }
+            // Then try yt-dlp for iframe players
+            else if (mainVideoInfo.iframeSrc) {
+              console.log(`📺 Detected iframe player: ${mainVideoInfo.iframeSrc}`);
+              finalVideoUrl = 'yt-dlp';
+            }
+            
+            await browser.close();
+            
+            // Download the video
+            if (finalVideoUrl === 'yt-dlp' || (finalVideoUrl === null && mainVideoInfo.iframeSrc)) {
+              console.log('\n📥 Using yt-dlp to download from iframe...');
+              try {
+                execSync(`yt-dlp -f "bestvideo+bestaudio/best" -o "video.%(ext)s" --merge-output-format mp4 "${url}"`, { 
+                  stdio: 'inherit',
+                  timeout: 600000 // 10 minutes
+                });
+                console.log('✅ Video downloaded successfully!');
+              } catch (e) {
+                console.error('❌ yt-dlp failed:', e.message);
+              }
+            } 
+            else if (finalVideoUrl && finalVideoUrl.startsWith('http')) {
+              console.log(`\n📥 Downloading main video...`);
+              
+              let downloadSuccess = false;
+              
+              if (finalVideoUrl.includes('.m3u8')) {
+                try {
+                  execSync(`ffmpeg -i "${finalVideoUrl}" -c copy -bsf:a aac_adtstoasc main_video.mp4 -y`, { 
+                    stdio: 'inherit',
+                    timeout: 600000
+                  });
+                  downloadSuccess = true;
+                } catch (e) {
+                  console.log('HLS download failed');
+                }
+              } else {
+                try {
+                  execSync(`wget --user-agent="Mozilla/5.0" --referer="${url}" --timeout=60 --tries=3 -O main_video.mp4 "${finalVideoUrl}"`, { 
+                    stdio: 'inherit',
+                    timeout: 600000
+                  });
+                  downloadSuccess = true;
+                } catch (e) {
+                  console.log('Direct download failed, trying yt-dlp as fallback...');
+                  execSync(`yt-dlp -f best -o "main_video.%(ext)s" "${url}"`, { stdio: 'inherit' });
+                  downloadSuccess = true;
+                }
+              }
+              
+              if (downloadSuccess && fs.existsSync('main_video.mp4')) {
+                // Create HTML player
+                const html = `<!DOCTYPE html>
+                <html>
+                <head>
+                  <title>Offline Video</title>
+                  <style>
+                    body { margin: 0; background: #000; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+                    video { max-width: 100%; max-height: 100vh; }
+                  </style>
+                </head>
+                <body>
+                  <video controls autoplay>
+                    <source src="main_video.mp4" type="video/mp4">
+                  </video>
+                </body>
+                </html>`;
+                fs.writeFileSync('player.html', html);
+                console.log('✅ Main video saved as main_video.mp4');
+              }
+            } 
+            else {
+              console.log('\n❌ Could not identify main video.');
+              console.log('💡 Possible reasons:');
+              console.log('   - Video is DRM protected');
+              console.log('   - Requires login');
+              console.log('   - Video loads from JavaScript with complex obfuscation');
+              console.log('\n🔧 Trying yt-dlp as last resort...');
+              try {
+                execSync(`yt-dlp -f best -o "video.%(ext)s" "${url}"`, { stdio: 'inherit' });
+              } catch (e) {
+                console.log('❌ All methods failed');
+              }
+            }
+            
+            // Find downloaded video file (rename to main_video.mp4 if necessary)
+            let videoFile = fs.readdirSync('.').find(f => f.match(/\.(mp4|mkv|webm|avi)$/i) && f !== 'player.html');
+            if (videoFile && videoFile !== 'main_video.mp4') {
+              fs.renameSync(videoFile, 'main_video.mp4');
+              videoFile = 'main_video.mp4';
+            }
+            
+            if (videoFile && fs.existsSync('main_video.mp4')) {
+              const stats = fs.statSync('main_video.mp4');
+              console.log(`\n✅ Success! Video saved as: main_video.mp4`);
+              console.log(`📦 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+            } else {
+              console.log('No video file found, exiting with error');
+              process.exit(1);
+            }
+            
+          })();
+          EOF
+
+      - name: Split video into 90MB chunks
+        run: |
+          # Create a directory for chunks (will be committed)
+          mkdir -p video_chunks
+          
+          # Split the video into 90MB parts (GitHub limit is 100MB, using 90MB for safety)
+          split -b 90m main_video.mp4 video_chunks/video_part_
+          
+          # Create metadata and assembly scripts
+          cat > video_chunks/README.md << 'EOF'
+          # 🎬 Downloaded Video Chunks
+          
+          This video has been split into 90MB chunks to comply with GitHub file size limits.
+          
+          ## 🔧 How to reassemble the video
+          
+          ### On Linux / macOS:
+          ```bash
+          cd video_chunks
+          cat video_part_* > main_video.mp4
+          ```
+          
+          ### On Windows (Command Prompt):
+          ```cmd
+          cd video_chunks
+          copy /b video_part_* main_video.mp4
+          ```
+          
+          ### On Windows (PowerShell):
+          ```powershell
+          Get-Content video_part_* -AsByteStream | Set-Content main_video.mp4 -AsByteStream
+          ```
+          
+          After reassembly, you can play `main_video.mp4` with any video player.
+          
+          ## 📝 Original Info
+          Download date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Original URL: ${{ github.event.inputs.url }}
+          EOF
+          
+          # Create assemble script for Unix
+          cat > video_chunks/assemble.sh << 'EOF'
+          #!/bin/bash
+          cat video_part_* > main_video.mp4
+          echo "✅ Video reassembled as main_video.mp4"
+          EOF
+          chmod +x video_chunks/assemble.sh
+          
+          # Create assemble batch file for Windows
+          cat > video_chunks/assemble.bat << 'EOF'
+          @echo off
+          copy /b video_part_* main_video.mp4
+          echo ✅ Video reassembled as main_video.mp4
+          EOF
+          
+          # List chunks with sizes
+          echo "Created chunks:"
+          ls -lh video_chunks/
+
+      - name: Remove original large video to save space in repo (optional)
+        run: |
+          # Keep only the chunks, remove the original large file
+          rm -f main_video.mp4
+          echo "Original video removed; only chunks kept."
+
+      - name: Commit chunks to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add the chunks directory
+          git add video_chunks/
+          
+          # Commit if there are changes
+          git diff --staged --quiet || git commit -m "Add video chunks (90MB parts) from ${{ github.event.inputs.url }} [skip ci]"
+          
+          # Push to repository
+          git push
+          
+          echo "✅ Video chunks successfully committed to repository"
